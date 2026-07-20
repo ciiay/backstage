@@ -18,6 +18,7 @@ import { WebSocket } from 'ws';
 import { EventsServiceSubscribeOptions } from '@backstage/plugin-events-node';
 import { SignalManager } from './SignalManager';
 import { mockServices } from '@backstage/backend-test-utils';
+import { JsonObject } from '@backstage/types';
 
 class MockWebSocket {
   closed: boolean = false;
@@ -69,8 +70,9 @@ const johnIdentity = {
   ownershipEntityRefs: ['user:default/john.doe'],
 };
 
-describe('SignalManager', () => {
-  let onEvent: Function;
+function createManager(config: JsonObject = {}) {
+  let onEvent: Function = async () => {};
+  const shutdownHooks: Function[] = [];
 
   const mockEvents = {
     publish: async () => {},
@@ -79,30 +81,58 @@ describe('SignalManager', () => {
     },
   };
 
-  const shutdownHooks: Function[] = [];
-  const mockLifecycle = mockServices.lifecycle.mock({
-    addShutdownHook: (hook: Function) => shutdownHooks.push(hook),
-  });
-
   const manager = SignalManager.create({
     events: mockEvents,
     logger: mockServices.logger.mock(),
-    config: mockServices.rootConfig(),
-    lifecycle: mockLifecycle,
+    config: mockServices.rootConfig({
+      data: {
+        signals: {
+          channels: ['notifications', 'user-settings', 'test'],
+          ...config,
+        },
+      },
+    }),
+    lifecycle: mockServices.lifecycle.mock({
+      addShutdownHook: (hook: Function) => shutdownHooks.push(hook),
+    }),
   });
 
-  afterAll(() => {
-    shutdownHooks.forEach(hook => hook());
+  return {
+    manager,
+    get onEvent() {
+      return onEvent;
+    },
+    shutdown() {
+      shutdownHooks.forEach(hook => hook());
+    },
+  };
+}
+
+describe('SignalManager', () => {
+  const managers: Array<{ shutdown: () => void }> = [];
+
+  afterEach(() => {
+    while (managers.length) {
+      managers.pop()?.shutdown();
+    }
   });
+
+  function managerWith(config: JsonObject = {}) {
+    const ctx = createManager(config);
+    managers.push(ctx);
+    return ctx;
+  }
 
   it('should close all connections when server is closed', () => {
+    const { manager, shutdown } = managerWith();
     const ws = new MockWebSocket();
     manager.addConnection(ws as unknown as WebSocket, guestIdentity);
-    shutdownHooks.forEach(hook => hook());
+    shutdown();
     expect(ws.closed).toBeTruthy();
   });
 
   it('should close connection on error', () => {
+    const { manager } = managerWith();
     const ws = new MockWebSocket();
     manager.addConnection(ws as unknown as WebSocket, guestIdentity);
 
@@ -111,8 +141,9 @@ describe('SignalManager', () => {
   });
 
   it('should allow subscribing and unsubscribing to events', async () => {
+    const ctx = managerWith();
     const ws = new MockWebSocket();
-    manager.addConnection(ws as unknown as WebSocket, guestIdentity);
+    ctx.manager.addConnection(ws as unknown as WebSocket, guestIdentity);
 
     ws.trigger(
       'message',
@@ -120,7 +151,7 @@ describe('SignalManager', () => {
       false,
     );
 
-    await onEvent({
+    await ctx.onEvent({
       topic: 'signals',
       eventPayload: {
         recipients: { type: 'broadcast' },
@@ -140,7 +171,7 @@ describe('SignalManager', () => {
       false,
     );
 
-    await onEvent({
+    await ctx.onEvent({
       topic: 'signals',
       eventPayload: {
         recipients: { type: 'broadcast' },
@@ -153,14 +184,15 @@ describe('SignalManager', () => {
   });
 
   it('should only send to users from identity', async () => {
+    const ctx = managerWith();
     const ws1 = new MockWebSocket();
-    manager.addConnection(ws1 as unknown as WebSocket, guestIdentity);
+    ctx.manager.addConnection(ws1 as unknown as WebSocket, guestIdentity);
 
     const ws2 = new MockWebSocket();
-    manager.addConnection(ws2 as unknown as WebSocket, johnIdentity);
+    ctx.manager.addConnection(ws2 as unknown as WebSocket, johnIdentity);
 
     const ws3 = new MockWebSocket();
-    manager.addConnection(ws3 as unknown as WebSocket, johnIdentity);
+    ctx.manager.addConnection(ws3 as unknown as WebSocket, johnIdentity);
 
     ws1.trigger(
       'message',
@@ -174,7 +206,7 @@ describe('SignalManager', () => {
       false,
     );
 
-    await onEvent({
+    await ctx.onEvent({
       topic: 'signals',
       eventPayload: {
         recipients: { type: 'user', entityRef: 'user:default/john.doe' },
@@ -189,5 +221,94 @@ describe('SignalManager', () => {
     expect(ws2.data[0]).toEqual(
       JSON.stringify({ channel: 'test', message: { msg: 'test' } }),
     );
+  });
+
+  it('should deny subscriptions to unknown channels', async () => {
+    const ctx = managerWith();
+    const ws = new MockWebSocket();
+    ctx.manager.addConnection(ws as unknown as WebSocket, johnIdentity);
+
+    ws.trigger(
+      'message',
+      JSON.stringify({ action: 'subscribe', channel: 'secret-channel' }),
+      false,
+    );
+
+    expect(ws.data).toEqual([
+      JSON.stringify({
+        type: 'error',
+        action: 'subscribe',
+        channel: 'secret-channel',
+        error: 'not_allowed',
+      }),
+    ]);
+    ws.data = [];
+
+    await ctx.onEvent({
+      topic: 'signals',
+      eventPayload: {
+        recipients: { type: 'broadcast' },
+        channel: 'secret-channel',
+        message: { msg: 'leak' },
+      },
+    });
+    expect(ws.data.length).toEqual(0);
+  });
+
+  it('should reject excess connections for the same user', () => {
+    const { manager } = managerWith({ maxConnectionsPerUser: 1 });
+    const ws1 = new MockWebSocket();
+    const ws2 = new MockWebSocket();
+
+    manager.addConnection(ws1 as unknown as WebSocket, johnIdentity);
+    manager.addConnection(ws2 as unknown as WebSocket, johnIdentity);
+
+    expect(ws1.closed).toBeFalsy();
+    expect(ws2.closed).toBeTruthy();
+  });
+
+  it('should reject excess subscriptions on a connection', () => {
+    const { manager } = managerWith({
+      channels: ['a', 'b'],
+      maxSubscriptionsPerConnection: 1,
+    });
+    const ws = new MockWebSocket();
+    manager.addConnection(ws as unknown as WebSocket, johnIdentity);
+
+    ws.trigger(
+      'message',
+      JSON.stringify({ action: 'subscribe', channel: 'a' }),
+      false,
+    );
+    ws.trigger(
+      'message',
+      JSON.stringify({ action: 'subscribe', channel: 'b' }),
+      false,
+    );
+
+    expect(ws.data).toEqual([
+      JSON.stringify({
+        type: 'error',
+        action: 'subscribe',
+        channel: 'b',
+        error: 'too_many_subscriptions',
+      }),
+    ]);
+  });
+
+  it('should reject oversized messages', () => {
+    const { manager } = managerWith({ maxMessageBytes: 16 });
+    const ws = new MockWebSocket();
+    manager.addConnection(ws as unknown as WebSocket, johnIdentity);
+
+    ws.trigger('message', 'x'.repeat(64), false);
+
+    expect(ws.data).toEqual([
+      JSON.stringify({
+        type: 'error',
+        action: 'message',
+        error: 'message_too_large',
+      }),
+    ]);
   });
 });

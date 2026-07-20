@@ -27,6 +27,11 @@ import {
 } from '@backstage/backend-plugin-api';
 import { Config } from '@backstage/config';
 
+const DEFAULT_CHANNELS = ['notifications', 'user-settings'];
+const DEFAULT_MAX_CONNECTIONS_PER_USER = 5;
+const DEFAULT_MAX_SUBSCRIPTIONS_PER_CONNECTION = 10;
+const DEFAULT_MAX_MESSAGE_BYTES = 64 * 1024;
+
 /**
  * @internal
  */
@@ -58,6 +63,10 @@ export class SignalManager {
   private events: EventsService;
   private logger: LoggerService;
   private pingInterval: ReturnType<typeof setInterval> | undefined;
+  private readonly allowedChannels: Set<string>;
+  private readonly maxConnectionsPerUser: number;
+  private readonly maxSubscriptionsPerConnection: number;
+  private readonly maxMessageBytes: number;
 
   static create(options: SignalManagerOptions) {
     return new SignalManager(options);
@@ -72,6 +81,21 @@ export class SignalManager {
     const id = `signals-${crypto.randomBytes(8).toString('hex')}`;
     this.logger = options.logger.child({ subscriberId: id });
     this.logger.info(`Signals manager is subscribing to signals events`);
+
+    this.allowedChannels = new Set(
+      options.config.getOptionalStringArray('signals.channels') ??
+        DEFAULT_CHANNELS,
+    );
+    this.maxConnectionsPerUser =
+      options.config.getOptionalNumber('signals.maxConnectionsPerUser') ??
+      DEFAULT_MAX_CONNECTIONS_PER_USER;
+    this.maxSubscriptionsPerConnection =
+      options.config.getOptionalNumber(
+        'signals.maxSubscriptionsPerConnection',
+      ) ?? DEFAULT_MAX_SUBSCRIPTIONS_PER_CONNECTION;
+    this.maxMessageBytes =
+      options.config.getOptionalNumber('signals.maxMessageBytes') ??
+      DEFAULT_MAX_MESSAGE_BYTES;
 
     this.events.subscribe({
       id,
@@ -109,7 +133,49 @@ export class SignalManager {
     this.connections.clear();
   }
 
+  private countConnectionsForUser(userEntityRef: string): number {
+    let count = 0;
+    for (const conn of this.connections.values()) {
+      if (conn.user === userEntityRef) {
+        count += 1;
+      }
+    }
+    return count;
+  }
+
+  private sendError(
+    connection: SignalConnection,
+    payload: {
+      action: string;
+      channel?: string;
+      error: string;
+    },
+  ) {
+    if (connection.ws.readyState !== WebSocket.OPEN) {
+      return;
+    }
+    connection.ws.send(
+      JSON.stringify({
+        type: 'error',
+        ...payload,
+      }),
+    );
+  }
+
   addConnection(ws: WebSocket, identity: BackstageUserInfo) {
+    if (
+      this.countConnectionsForUser(identity.userEntityRef) >=
+      this.maxConnectionsPerUser
+    ) {
+      this.logger.warn('WebSocket connection rejected: too many connections', {
+        userEntityRef: identity.userEntityRef,
+        maxConnectionsPerUser: this.maxConnectionsPerUser,
+      });
+      ws.close();
+      ws.terminate();
+      return;
+    }
+
     // Start pinging on first connection
     if (!this.pingInterval) {
       this.pingInterval = setInterval(() => this.ping(), 30000);
@@ -158,8 +224,23 @@ export class SignalManager {
       if (isBinary) {
         return;
       }
+
+      const raw = data.toString();
+      if (Buffer.byteLength(raw, 'utf8') > this.maxMessageBytes) {
+        this.logger.info('Signal message rejected: too large', {
+          userEntityRef: conn.user,
+          connectionId: conn.id,
+          maxMessageBytes: this.maxMessageBytes,
+        });
+        this.sendError(conn, {
+          action: 'message',
+          error: 'message_too_large',
+        });
+        return;
+      }
+
       try {
-        const json = JSON.parse(data.toString()) as JsonObject;
+        const json = JSON.parse(raw) as JsonObject;
         this.handleMessage(conn, json);
       } catch (err: any) {
         this.logger.error(
@@ -171,10 +252,39 @@ export class SignalManager {
 
   private handleMessage(connection: SignalConnection, message: JsonObject) {
     if (message.action === 'subscribe' && message.channel) {
-      this.logger.debug(
-        `Connection ${connection.id} subscribed to ${message.channel}`,
-      );
-      connection.subscriptions.add(message.channel as string);
+      const channel = message.channel as string;
+
+      if (!this.allowedChannels.has(channel)) {
+        this.logger.info('Signal subscription denied', {
+          userEntityRef: connection.user,
+          channel,
+          connectionId: connection.id,
+        });
+        this.sendError(connection, {
+          action: 'subscribe',
+          channel,
+          error: 'not_allowed',
+        });
+        return;
+      }
+
+      if (connection.subscriptions.size >= this.maxSubscriptionsPerConnection) {
+        this.logger.info('Signal subscription denied: too many subscriptions', {
+          userEntityRef: connection.user,
+          channel,
+          connectionId: connection.id,
+          maxSubscriptionsPerConnection: this.maxSubscriptionsPerConnection,
+        });
+        this.sendError(connection, {
+          action: 'subscribe',
+          channel,
+          error: 'too_many_subscriptions',
+        });
+        return;
+      }
+
+      this.logger.debug(`Connection ${connection.id} subscribed to ${channel}`);
+      connection.subscriptions.add(channel);
     } else if (message.action === 'unsubscribe' && message.channel) {
       this.logger.debug(
         `Connection ${connection.id} unsubscribed from ${message.channel}`,
